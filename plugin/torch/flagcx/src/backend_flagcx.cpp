@@ -663,8 +663,38 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
     std::stable_sort(
         pairCoalesce_.pendingOps.begin(), pairCoalesce_.pendingOps.end(),
         [](const auto &a, const auto &b) { return a.first < b.first; });
-    for (auto &kv : pairCoalesce_.pendingOps) {
-      kv.second();
+    // Submit the pending operations of each peer inside one group.
+    //
+    // Without a group the HCCL adaptor takes its groupDepth == 0 path and calls
+    // the blocking HcclSend/HcclRecv. batch_isend_irecv posts a send before a
+    // recv on both sides of a pair, so both ranks block in their send waiting
+    // for the peer to post the matching recv, and the call never returns. This
+    // makes any pipeline-parallel run (PP > 1) hang on its first step, because
+    // Megatron's send_forward_recv_backward is built on batch_isend_irecv.
+    //
+    // Inside a group the adaptor accumulates the operations and submits them as
+    // a single HcclBatchSendRecv, which performs the exchange in both
+    // directions at once. The non-pair-communicator branch of this function
+    // already wraps its operations in groupStart()/groupEnd().
+    //
+    // pendingOps is already sorted by peer, so group each run of equal peers.
+    {
+      size_t i = 0;
+      const size_t n = pairCoalesce_.pendingOps.size();
+      while (i < n) {
+        const int peer = pairCoalesce_.pendingOps[i].first;
+        size_t j = i;
+        while (j < n && pairCoalesce_.pendingOps[j].first == peer) {
+          ++j;
+        }
+        auto pairComm = getOrCreatePairComm(peer);
+        C10D_FLAGCX_CHECK(flagcxGroupStart(pairComm), std::nullopt);
+        for (size_t k = i; k < j; ++k) {
+          pairCoalesce_.pendingOps[k].second();
+        }
+        C10D_FLAGCX_CHECK(flagcxGroupEnd(pairComm), std::nullopt);
+        i = j;
+      }
     }
     pairCoalesce_.pendingOps.clear();
     pairCoalesce_.active = false;
