@@ -394,9 +394,19 @@ flagcxBackend::flagcxBackend(const c10::intrusive_ptr<::c10d::Store> &store,
 #endif
 
 flagcxBackend::~flagcxBackend() {
+#if defined(USE_ASCEND_ADAPTOR) && !defined(FLAGCX_TORCH_BACKEND_FLAGOS)
+  // On Ascend, flagcxStreams_ holds pointers into aclStreams_. The streams
+  // themselves are owned by PyTorch and were never produced by streamCreate(),
+  // so destroying them frees memory this backend does not own. This showed up
+  // as "free(): invalid pointer" followed by SIGABRT at interpreter shutdown,
+  // making every run exit non-zero even after the work had completed.
+  flagcxStreams_.clear();
+  aclStreams_.clear();
+#else
   for (auto &s : flagcxStreams_) {
     devHandle_->streamDestroy(s.second);
   }
+#endif
   // Pair communicators can be initialized lazily by send/recv, before the
   // process-group communicator is initialized.
   for (auto &kv : pairComms_) {
@@ -416,22 +426,40 @@ flagcxBackend::~flagcxBackend() {
 }
 
 flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
+#if defined(USE_ASCEND_ADAPTOR) && !defined(FLAGCX_TORCH_BACKEND_FLAGOS)
+  // Always resolve PyTorch's *current* NPU stream; never cache it.
+  //
+  // The previous code captured the current stream on the first call and cached
+  // the pointer for the lifetime of the backend. Whenever PyTorch switched
+  // streams afterwards - communication/computation overlap, or an explicit
+  // side stream - collectives were still issued on the stale stream and had no
+  // ordering relationship with the stream that produced or consumed the data.
+  //
+  // stream(need_empty=true) additionally drains torch_npu's asynchronous task
+  // queue before returning the raw ACL stream. With need_empty=false the queue
+  // is not drained, so a kernel still sitting in the software queue can reach
+  // the stream *after* a collective that was submitted directly to it, and the
+  // collective then operates on pre-reduction data.
+  //
+  // Measured on Ascend 910C (bf16/fp32, 4096 elements, 16 ranks): roughly 1.4%
+  // of all_reduce calls returned a wrong result before this change, and
+  // running the same call from an explicit side stream failed 60 out of 60
+  // times. HCCL under identical conditions had no failures.
+  aclStreams_[streamId] = c10_npu::getCurrentNPUStream().stream(true);
+  flagcxStreams_[streamId] =
+      reinterpret_cast<flagcxStream_t>(&aclStreams_[streamId]);
+  return flagcxStreams_[streamId];
+#else
   if (auto search = flagcxStreams_.find(streamId);
       search != flagcxStreams_.end()) {
     return search->second;
   } else {
     flagcxStreams_[streamId] = nullptr;
-#if defined(USE_ASCEND_ADAPTOR) && !defined(FLAGCX_TORCH_BACKEND_FLAGOS)
-    // TODO: The getStreamFromExternal interface is not supported at this stage
-    // on NPU. Adaptation modifications will be made in the future.
-    acl_stream = c10_npu::getCurrentNPUStream().stream(false);
-    flagcxStreams_[streamId] = reinterpret_cast<flagcxStream_t>(&acl_stream);
-#else
     C10D_FLAGCX_CHECK(devHandle_->streamCreate(&flagcxStreams_[streamId]),
                       std::nullopt);
-#endif
     return flagcxStreams_[streamId];
   }
+#endif
 }
 
 std::unique_ptr<flagcxEvent> &flagcxBackend::getEventByIndex(int eventId) {
