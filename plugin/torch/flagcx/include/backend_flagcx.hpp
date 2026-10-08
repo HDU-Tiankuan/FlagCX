@@ -311,6 +311,9 @@ protected:
   // flagcxStreams_ stored a pointer to it, so different stream ids aliased the
   // same storage.
   std::unordered_map<int, aclrtStream> aclStreams_;
+  // Set while a coalesced pair-comm batch is open, so that getStreamByIndex()
+  // keeps returning the stream the batch started on.
+  bool coalescedStreamPinned_ = false;
 #endif
 
   // Heterogeneous P2P uses the process-group communicator. Homogeneous P2P

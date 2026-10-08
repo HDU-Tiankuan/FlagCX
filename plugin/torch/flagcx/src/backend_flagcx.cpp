@@ -441,11 +441,23 @@ flagcxStream_t flagcxBackend::getStreamByIndex(int streamId) {
   // the stream *after* a collective that was submitted directly to it, and the
   // collective then operates on pre-reduction data.
   //
-  // Measured on Ascend 910C (bf16/fp32, 4096 elements, 16 ranks): roughly 1.4%
-  // of all_reduce calls returned a wrong result before this change, and
-  // running the same call from an explicit side stream failed 60 out of 60
-  // times. HCCL under identical conditions had no failures.
-  aclStreams_[streamId] = c10_npu::getCurrentNPUStream().stream(true);
+  // Measured on Ascend 910C (4096 elements, 16 ranks): all_reduce returned a
+  // wrong result on 2 of 400 calls before this change, and running the same
+  // call from an explicit side stream failed on 59 of 60. HCCL under identical
+  // conditions had no failures.
+  //
+  // While a coalesced pair-comm batch is open the slot is pinned. The deferred
+  // send and recv lambdas each hold a pointer to this one slot, so refreshing
+  // it here would silently move the operations enqueued earlier in the batch
+  // onto whichever stream the last one resolved, losing their ordering against
+  // the kernels that produced their data. startCoalescing() resolves the slot
+  // once and endCoalescing() releases it, so a batch is submitted on a single
+  // stream - the same guarantee the NCCL backend gives for coalesced
+  // operations.
+  if (!coalescedStreamPinned_ ||
+      aclStreams_.find(streamId) == aclStreams_.end()) {
+    aclStreams_[streamId] = c10_npu::getCurrentNPUStream().stream(true);
+  }
   flagcxStreams_[streamId] =
       reinterpret_cast<flagcxStream_t>(&aclStreams_[streamId]);
   return flagcxStreams_[streamId];
@@ -647,6 +659,13 @@ void flagcxBackend::startCoalescing() {
                 "Nested coalescing is not supported for pair P2P operations");
     pairCoalesce_.active = true;
     pairCoalesce_.pendingOps.clear();
+#if defined(USE_ASCEND_ADAPTOR) && !defined(FLAGCX_TORCH_BACKEND_FLAGOS)
+    // Pin the submission stream for the whole batch. The operations below are
+    // deferred until endCoalescing() and all refer to the same slot, so the
+    // slot is resolved once, here, rather than on every send/recv.
+    aclStreams_[0] = c10_npu::getCurrentNPUStream().stream(true);
+    coalescedStreamPinned_ = true;
+#endif
   } else {
     TORCH_CHECK(status_ == 1,
                 "Heterogeneous P2P communicator was not eagerly initialized");
@@ -715,6 +734,11 @@ c10::intrusive_ptr<Work> flagcxBackend::endCoalescing() {
   work->future_ = c10::make_intrusive<c10::ivalue::Future>(
       c10::ListType::create(c10::TensorType::get()));
   work->future_->markCompleted(c10::IValue(0));
+#if defined(USE_ASCEND_ADAPTOR) && !defined(FLAGCX_TORCH_BACKEND_FLAGOS)
+  // Released only now: the Work above represents the batch, and its completion
+  // event has to be recorded on the same stream the batch was submitted on.
+  coalescedStreamPinned_ = false;
+#endif
   return work;
 }
 
